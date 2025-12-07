@@ -13,25 +13,27 @@ def get_multimodal_transforms(config: Config, ds_type="train"):
                     max_size=max(cfg.input_size[1], cfg.input_size[2]), p=1.0),
                 A.RandomCrop(
                     height=cfg.input_size[1], width=cfg.input_size[2], p=1.0),
-                A.Affine(scale=(0.8, 1.2),
-                        rotate=(-15, 15),
-                        translate_percent=(-0.1, 0.1),
-                        shear=(-10, 10),
+                A.HorizontalFlip(p=0.5),
+                A.VerticalFlip(p=0.5),
+                A.Affine(scale=(0.95, 1.05),
+                        rotate=(-10, 10),
+                        translate_percent=(-0.05, 0.05),
+                        shear=(-5, 5),
                         fill=0,
-                        p=0.8),
-                A.CoarseDropout(num_holes_range=(2, 8),
+                        p=0.5),
+                A.CoarseDropout(num_holes_range=(2, 3),
                                 hole_height_range=(int(0.07 * cfg.input_size[1]),
-                                                int(0.15 * cfg.input_size[1])),
-                                hole_width_range=(int(0.1 * cfg.input_size[2]),
-                                                int(0.15 * cfg.input_size[2])),
+                                                int(0.12 * cfg.input_size[1])),
+                                hole_width_range=(int(0.07 * cfg.input_size[2]),
+                                                int(0.11 * cfg.input_size[2])),
                                 fill=0,
                                 p=0.5),
                 A.ColorJitter(
-                    brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1, p=0.7),
+                    brightness=0.1, contrast=0.15, saturation=0.5, hue=0.07, p=0.7),
                 A.Normalize(mean=cfg.mean, std=cfg.std),
                 A.ToTensorV2(p=1.0)
             ],
-            seed=42,
+            seed=config.SEED,
         )
     else:
         transforms = A.Compose(

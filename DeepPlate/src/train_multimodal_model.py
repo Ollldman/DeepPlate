@@ -1,176 +1,166 @@
 import torch
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
-from functools import partial
 from tqdm import tqdm
-from transformers import AutoTokenizer
-from torchmetrics import F1Score, Metric
+from torchmetrics import MeanAbsoluteError, R2Score
+import os
+from pathlib import Path
+import random
+import numpy as np
 
-# Наши модули для мультимодальной нейросети
-from DeepPlate import (
-    MultimodalDataset,
-    multimodal_collate_fn, 
-    get_multimodal_transforms,
-    CrossAttentionModel,
-    set_requires_grad,
-    Config
-)
+from .multimodal_dataset import MultimodalDataset
+from .multimodal_collate_fn import multimodal_collate_fn
+from .get_multimodal_transforms import get_multimodal_transforms
+from ..experiment_config import Config
 
-def train_multimodal_model(config: Config) -> None:
+
+def seed_everywhere(seed: int) -> None:
     """
-    End-to-end training pipeline for a multimodal (text + image) classification model.
-
-    This function:
-    - Initializes model, tokenizer, and data loaders from a single config,
-    - Applies layer freezing/unfreezing as specified,
-    - Runs training with per-epoch validation,
-    - Saves the best checkpoint based on validation accuracy.
+    Set seed for all possible sources of randomness to ensure reproducibility.
 
     Args:
-        config (Any): Configuration object with the following expected attributes:
-            - TEXT_MODEL_NAME, IMAGE_MODEL_NAME (str)
-            - TEXT_MODEL_UNFREEZE, IMAGE_MODEL_UNFREEZE (str)
-            - BATCH_SIZE, EPOCHS, HIDDEN_DIM, NUM_CLASSES (int)
-            - TEXT_LR, IMAGE_LR, CLASSIFIER_LR (float)
-            - TRAIN_DF_PATH, VAL_DF_PATH, SAVE_PATH (str)
+        seed (int): Random seed.
     """
-    # === Устройство ===
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)  # for multi-GPU
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    os.environ["PYTHONHASHSEED"] = str(seed)
+
+def train_multimodal_model(model, config: Config) -> None:
+    """
+    End-to-end training pipeline for multimodal calorie regression.
+
+    Args:
+        config (Config): Training configuration with all hyperparameters and paths.
+    """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Training on device: {device}")
+    seed_everywhere(config.SEED)
 
-    # === Модель и токенизатор ===
-    model = CrossAttentionModel(config).to(device)
-    tokenizer = AutoTokenizer.from_pretrained(config.TEXT_MODEL_NAME)
-
-    # === Разморозка слоёв ===
-    set_requires_grad(model.text_model, unfreeze_pattern=config.TEXT_MODEL_UNFREEZE)
-    set_requires_grad(model.image_model, unfreeze_pattern=config.IMAGE_MODEL_UNFREEZE)
-
-    # === Оптимизатор с раздельными LR ===
-    optimizer = AdamW([
-        {"params": model.text_model.parameters(), "lr": config.TEXT_LR},
-        {"params": model.image_model.parameters(), "lr": config.IMAGE_LR},
-        {"params": model.classifier.parameters(), "lr": config.CLASSIFIER_LR},
-    ])
-
-    # === Loss ===
-    criterion = torch.nn.CrossEntropyLoss()
-
-    # === DataLoader'ы ===
+    # === Transforms ===
     train_transforms = get_multimodal_transforms(config, ds_type="train")
-    val_transforms = get_multimodal_transforms(config, ds_type="val")
+    val_transforms = get_multimodal_transforms(config, ds_type="test")
 
-    train_dataset = MultimodalDataset(config, transforms=train_transforms, dataset_type="train")
-    val_dataset = MultimodalDataset(config, transforms=val_transforms, dataset_type="val")
+    # === Datasets ===
+    train_dataset = MultimodalDataset(config, split="train", transform=train_transforms)
+    val_dataset = MultimodalDataset(config, split="test", transform=val_transforms)
 
+    # === DataLoaders ===
     train_loader = DataLoader(
         train_dataset,
         batch_size=config.BATCH_SIZE,
         shuffle=True,
-        collate_fn=partial(multimodal_collate_fn, tokenizer=tokenizer),
-        num_workers=4,
+        collate_fn=multimodal_collate_fn,
+        num_workers=config.NUM_WORKERS,
         pin_memory=True,
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=config.BATCH_SIZE,
         shuffle=False,
-        collate_fn=partial(multimodal_collate_fn, tokenizer=tokenizer),
-        num_workers=4,
+        collate_fn=multimodal_collate_fn,
+        num_workers=config.NUM_WORKERS,
         pin_memory=True,
     )
 
-    # === Цикл обучения ===
-    f1_metric = F1Score(
-        task="binary" if config.NUM_CLASSES == 2 else "multiclass", 
-        num_classes=config.NUM_CLASSES).to(device)
-    f1_metric_train = F1Score(
-        task="binary" if config.NUM_CLASSES == 2 else "multiclass", 
-        num_classes=config.NUM_CLASSES).to(device)
-    best_f1 = 0.0
-    print("🚀 Starting training...")
+    # === Model ===
+    model = model.to(device)
+
+    # === Optimizer ===
+    optimizer = AdamW([
+        {"params": model.text_model.parameters(), "lr": config.TEXT_LR},
+        {"params": model.image_model.parameters(), "lr": config.IMAGE_LR},
+        {"params": model.mass_mlp.parameters(), "lr": config.HEAD_LR},
+        {"params": model.cross_attn.parameters(), "lr": config.FUSION_LR},
+        {"params": model.regressor.parameters(), "lr": config.HEAD_LR},
+    ])
+
+    # === Loss & Metrics ===
+    criterion = torch.nn.HuberLoss(delta=1.0)
+    mae_metric = MeanAbsoluteError().to(device)
+    r2_metric = R2Score().to(device)
+
+    # === Training Loop ===
+    best_val_mae = float("inf")
+    Path(config.model_save_path).parent.mkdir(parents=True, exist_ok=True)
+
+    print("Starting training...")
 
     for epoch in range(1, config.EPOCHS + 1):
+        # --- Training ---
         model.train()
-        total_loss = 0.0
-        num_batches = len(train_loader)
+        train_loss = 0.0
+        mae_metric.reset()
+        r2_metric.reset()
 
         with tqdm(
-            total=num_batches,
-            desc=f"Epoch {epoch}/{config.EPOCHS}",
+            total=len(train_loader),
+            desc=f"Epoch {epoch}/{config.EPOCHS} [Train]",
             unit="batch",
-            leave=True
+            leave=False,
         ) as pbar:
             for batch in train_loader:
-                # Перенос на устройство
-                inputs = {
-                    "input_ids": batch["input_ids"].to(device, non_blocking=True),
-                    "attention_mask": batch["attention_mask"].to(device, non_blocking=True),
-                    "image": batch["image"].to(device, non_blocking=True),
-                }
+                image = batch["image"].to(device, non_blocking=True)
+                input_ids = batch["input_ids"].to(device, non_blocking=True)
+                attention_mask = batch["attention_mask"].to(device, non_blocking=True)
+                mass = batch["mass"].to(device, non_blocking=True)
                 labels = batch["label"].to(device, non_blocking=True)
 
-                # Forward
                 optimizer.zero_grad()
-                logits = model(**inputs)
-                loss = criterion(logits, labels)
-
-                # Backward
+                preds = model(image=image, input_ids=input_ids, attention_mask=attention_mask, mass=mass)
+                loss = criterion(preds, labels)
                 loss.backward()
                 optimizer.step()
 
-                total_loss += loss.item()
-                # f1 score
-                _ = f1_metric_train(
-                    preds=logits.softmax(),
-                    labels=labels
-                )
+                train_loss += loss.item()
+                mae_metric.update(preds, labels)
+                r2_metric.update(preds, labels)
+
                 pbar.set_postfix({"Loss": f"{loss.item():.4f}"})
                 pbar.update(1)
-        result_epoch_f1_train_score = f1_metric_train.compute().cpu().numpy()
-        f1_metric_train.reset()
 
-        val_f1 = validate(
-            model=model, 
-            val_loader=val_loader,
-            device=device,
-            fone=f1_metric)
-        f1_metric.reset()
+        avg_train_loss = train_loss / len(train_loader)
+        train_mae = mae_metric.compute().item()
+        train_r2 = r2_metric.compute().item()
 
+        # --- Validation ---
+        model.eval()
+        val_loss = 0.0
+        mae_metric.reset()
+        r2_metric.reset()
+
+        with torch.no_grad():
+            for batch in val_loader:
+                image = batch["image"].to(device, non_blocking=True)
+                input_ids = batch["input_ids"].to(device, non_blocking=True)
+                attention_mask = batch["attention_mask"].to(device, non_blocking=True)
+                mass = batch["mass"].to(device, non_blocking=True)
+                labels = batch["label"].to(device, non_blocking=True)
+
+                preds = model(image=image, input_ids=input_ids, attention_mask=attention_mask, mass=mass)
+                loss = criterion(preds, labels)
+
+                val_loss += loss.item()
+                mae_metric.update(preds, labels)
+                r2_metric.update(preds, labels)
+
+        avg_val_loss = val_loss / len(val_loader)
+        val_mae = mae_metric.compute().item()
+        val_r2 = r2_metric.compute().item()
+
+        # --- Logging ---
         print(
-            f"Epoch {epoch+1}/{config.EPOCHS} \n| avg_Loss: {total_loss/len(train_loader):.4f}\n| Train F1: {result_epoch_f1_train_score} \n| Val F1: {val_f1 :.4f}")
+            f"Epoch {epoch}/{config.EPOCHS} | "
+            f"Train Loss: {avg_train_loss:.4f}, MAE: {train_mae:.2f}, R²: {train_r2:.4f} | "
+            f"Val Loss: {avg_val_loss:.4f}, MAE: {val_mae:.2f}, R²: {val_r2:.4f}"
+        )
 
-        # === Сохранение лучшей модели ===
-        if val_f1 > best_f1:
-            best_f1 = val_f1
-            torch.save(model.state_dict(), config.SAVE_PATH)
-            print(f"🏆 New best model saved: {config.SAVE_PATH} (val_f1 = {val_f1:.4f})\n")
-        else:
-            print("   ❌ No improvement.\n")
-
-
-@torch.no_grad()
-def validate(
-    model: torch.nn.Module, 
-    val_loader: DataLoader, 
-    device: torch.device,
-    fone: Metric) -> float:
-    """Compute validation accuracy."""
-    model.eval()
-
-    for batch in val_loader:
-        inputs = {
-            "input_ids": batch["input_ids"].to(device),
-            "attention_mask": batch["attention_mask"].to(device),
-            "image": batch["image"].to(device),
-        }
-        labels = batch["label"].to(device)
-
-        logits = model(**inputs)
-        _, preds = logits.argmax(dim=1)
-        _ = fone(preds=preds, target=labels)
-        # correct += (preds == labels).sum().item()
-        # total += labels.size(0)
-
-    # return correct / total
-    return fone.compute().cpu().numpy()
+        # --- Save best model (by val MAE) ---
+        if val_mae < best_val_mae:
+            best_val_mae = val_mae
+            torch.save(model.state_dict(), config.model_save_path)
+            print(f"New best model saved: {config.model_save_path} (Val MAE: {val_mae:.2f})")
