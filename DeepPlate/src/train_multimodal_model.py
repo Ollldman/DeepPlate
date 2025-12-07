@@ -1,4 +1,3 @@
-import torch
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -7,6 +6,7 @@ import os
 from pathlib import Path
 import random
 import numpy as np
+import torch
 
 from .multimodal_dataset import MultimodalDataset
 from .multimodal_collate_fn import multimodal_collate_fn

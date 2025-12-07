@@ -1,4 +1,3 @@
-
 from typing import Dict, Any, Union, List
 import random
 import torch
@@ -142,7 +141,7 @@ class MultimodalDataset(Dataset):
 
         
     def get_raw_sample_for_vis(self, idx: int) -> Dict[str, Any]:
-        """Same as get_raw_item, but kept for clarity in visualization context."""
+        """For clarity in visualization context."""
         return self.get_raw_item(idx)
 
     def show_samples(

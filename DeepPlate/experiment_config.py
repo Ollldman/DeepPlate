@@ -41,11 +41,11 @@ class Config(BaseModel):
     
     # --- Regression head  ---
     HIDDEN_DIM: int = 512  # размер скрытого слоя перед выходом
-    DROPOUT: float = 0.3  # для регуляризации регрессии
+    DROPOUT: float = 0.2  # для регуляризации регрессии
 
     # --- Training hyperparameters ---
     BATCH_SIZE: int = Field(default=16, ge=1) # можно 16 если мало памяти
-    EPOCHS: int = Field(default=2, ge=1)
+    EPOCHS: int = Field(default=40, ge=1)
     SEED: int = 2025
     NUM_WORKERS: int = 4
     
