@@ -1,4 +1,4 @@
-# DeepPlate: Multimodal Deep Learning for Calorie Estimation (educational project)
+ # DeepPlate: Multimodal Deep Learning for Calorie Estimation (educational project) <img src="icon.png" alt="DeepPlate icon" width="40" height="40"> 
 
 ![PyTorch](https://img.shields.io/badge/PyTorch-%23EE4C2C.svg?logo=PyTorch&logoColor=white)
 ![Transformers](https://img.shields.io/badge/🤗%20Transformers-FFD21E.svg?logo=huggingface&logoColor=black)
@@ -56,3 +56,6 @@ poetry install
 ## Goal
 
 Select and train a multimodal model suitable for integration into health and fitness applications that helps users estimate meal calories from a photo and ingredient list.
+
+## This repository:
+[📸 DeepPlate](https://github.com/Ollldman/DeepPlate.git)
